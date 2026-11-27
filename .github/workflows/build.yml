@@ -1,7 +1,17 @@
 name: Build APK
-on: [push, workflow_dispatch]
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      game_package:
+        description: "Exported game package .zip in this repo (leave empty to just build GamePort)"
+        required: false
+        default: ""
+permissions:
+  contents: write
 jobs:
-  build:
+  app:
+    if: ${{ github.event_name == 'push' || inputs.game_package == '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -12,9 +22,69 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.9
-      - run: unzip -o GamePortAndroid*.zip
+      - run: unzip -o -q "$(ls GamePortAndroid*.zip | sort -V | tail -n1)"
       - run: cd GamePortAndroid && gradle assembleDebug --no-daemon -Pandroid.useAndroidX=true -Dorg.gradle.jvmargs=-Xmx3g
-      - uses: actions/upload-artifact@v4
+      - run: cp GamePortAndroid/app/build/outputs/apk/debug/*.apk GamePort.apk
+      - uses: softprops/action-gh-release@v2
         with:
-          name: GamePort-debug-apk
-          path: GamePortAndroid/app/build/outputs/apk/debug/*.apk
+          tag_name: app-${{ github.run_number }}
+          name: GamePort build ${{ github.run_number }}
+          files: GamePort.apk
+
+  game:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.game_package != '' }}
+    runs-on: ubuntu-latest
+    env:
+      GAME_PACKAGE: ${{ inputs.game_package }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - uses: android-actions/setup-android@v3
+      - name: Install the SDK parts Winlator needs
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;24.0.8215888" "cmake;3.22.1"
+      - name: Unpack GamePort (for its tools and signing key)
+        run: unzip -o -q "$(ls GamePortAndroid*.zip | sort -V | tail -n1)"
+      - name: Get the Winlator app source
+        run: |
+          git clone --depth 1 https://github.com/brunodev85/winlator-app
+          cd winlator-app
+          git archive --format=zip --prefix=winlator-app-main/ -o ../winlator-app-main.zip HEAD
+      - name: Make the per-game project
+        run: |
+          python3 GamePortAndroid/tools/gameport_winlator_fork.py \
+            --winlator-source winlator-app-main.zip \
+            --game-package "$GAME_PACKAGE" \
+            --version-code $((1000 + GITHUB_RUN_NUMBER)) \
+            --output out/GameProject.zip
+      - name: Add Winlator runtime files if the source lacks them
+        run: |
+          cd out && unzip -q GameProject.zip && cd WinlatorGameProject
+          A=app/src/main/assets
+          if [ ! -f "$A/rootfs.tzst" ] && [ ! -f "$A/imagefs.txz" ]; then
+            echo "Runtime files not in the source; copying them from the official Winlator 11.2 release APK"
+            gh release download v11.2.0 --repo brunodev85/winlator --pattern '*.apk' --dir /tmp/wl
+            mkdir -p "$A" /tmp/wl/x
+            unzip -q -o /tmp/wl/*.apk 'assets/*' -d /tmp/wl/x
+            cp -rn /tmp/wl/x/assets/. "$A"/
+          fi
+      - name: Build the game APK
+        run: |
+          cd out/WinlatorGameProject
+          gradle assembleDebug --no-daemon -Dorg.gradle.jvmargs=-Xmx4g \
+            -Pandroid.injected.signing.store.file="$GITHUB_WORKSPACE/GamePortAndroid/app/gameport-signing.p12" \
+            -Pandroid.injected.signing.store.password=gameport-key-1 \
+            -Pandroid.injected.signing.key.alias=gameport \
+            -Pandroid.injected.signing.key.password=gameport-key-1
+      - run: cp out/WinlatorGameProject/app/build/outputs/apk/debug/*.apk GamePortGame.apk
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: game-${{ github.run_number }}
+          name: Game APK build ${{ github.run_number }}
+          files: GamePortGame.apk
